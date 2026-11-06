@@ -67,6 +67,8 @@ let patchedSocket: GatewaySocket | undefined
 let unpatchSocket: (() => void) | undefined
 let retryPending = false
 let lastIdentifyAt = 0
+/** Sockets we already forced a fresh IDENTIFY on, so boot polling never repeats it. */
+let forcedSockets = new WeakSet<GatewaySocket>()
 let transportErrorReported = false
 const transportPatches = new Map<Transport, () => void>()
 const timers = new Set<Timer>()
@@ -256,6 +258,7 @@ export function forceIdentify() {
 		else patchTransport(socket)
 
 		lastIdentifyAt = Date.now()
+		forcedSockets.add(socket)
 		for (const listener of identifyListeners) listener()
 
 		socket.sessionId = null
@@ -285,7 +288,9 @@ function attachToGateway() {
 		if (!live || live === lastSeen) return
 		lastSeen = live
 		if (live !== patchedSocket) patchSocket(live)
-		if (getPlatform() !== 'off') forceIdentify()
+		// attach() already forced this socket; forcing again would open a second
+		// fresh session a few seconds after the first (suspected cause of logouts).
+		if (getPlatform() !== 'off' && !forcedSockets.has(live)) forceIdentify()
 	})
 }
 
@@ -294,6 +299,7 @@ function teardown() {
 	timers.clear()
 	retryPending = false
 	lastIdentifyAt = 0
+	forcedSockets = new WeakSet()
 	unpatchSocket?.()
 	unpatchTransports()
 	unpatchSocket = patchedSocket = socketModule = storage = undefined
