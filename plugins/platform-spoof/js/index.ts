@@ -12,6 +12,8 @@ export const DefaultPlatform: Platform = 'off'
 
 export interface Settings {
 	platform: Platform
+	/** Last gateway close seen while spoofing, shown in settings for debugging. */
+	lastClose?: string
 }
 
 /** Gateway IDENTIFY properties that make Discord show each client icon. */
@@ -26,6 +28,10 @@ const SpoofedProperties: Record<
 }
 
 const IdentifyOp = 2
+/** Gateway close code for a rejected token; Discord's client logs you out on it. */
+const AuthFailedCode = 4004
+/** Reconnectable close code the client answers with a fresh connection. */
+const ReconnectCode = 4000
 const WebSocketConnecting = 0
 const WebSocketOpen = 1
 const WebSocketClosing = 2
@@ -35,8 +41,14 @@ const MinReconnectIntervalMs = 3000
 
 interface Transport {
 	readyState: number
+	onclose?: unknown
 	send(data: unknown): void
 	close(): void
+}
+
+interface CloseEventLike {
+	code?: number
+	reason?: string
 }
 
 interface GatewaySocket {
@@ -70,6 +82,7 @@ let lastIdentifyAt = 0
 /** Sockets we already forced a fresh IDENTIFY on, so boot polling never repeats it. */
 let forcedSockets = new WeakSet<GatewaySocket>()
 let transportErrorReported = false
+let authRescueUsed = false
 const transportPatches = new Map<Transport, () => void>()
 const timers = new Set<Timer>()
 const identifyListeners = new Set<() => void>()
@@ -120,14 +133,58 @@ function applySpoof(payload: IdentifyPayload | undefined) {
 	return true
 }
 
+function recordClose(note: string) {
+	const platform = getPlatform()
+	try {
+		storage?.set({ platform, lastClose: note })
+	} catch (e) {
+		reportError(e)
+	}
+}
+
+/**
+ * Watches gateway closes while spoofing. If Discord rejects the spoofed login
+ * with an auth failure, the client would log the account out. Turn the spoof
+ * off and report a reconnectable close instead, once per forced identify.
+ */
+function wrapClose(transport: Transport) {
+	const original = transport.onclose
+	if (typeof original !== 'function') return () => {}
+
+	const wrapped = function (this: unknown, event: CloseEventLike) {
+		let forwarded = event
+		try {
+			if (getPlatform() !== 'off') {
+				const code = event?.code
+				const when = new Date().toISOString()
+				if (code === AuthFailedCode && !authRescueUsed) {
+					authRescueUsed = true
+					const note = `${code} ${event?.reason ?? ''} at ${when}: spoof turned off to avoid logout`
+					storage?.set({ platform: DefaultPlatform, lastClose: note })
+					forwarded = { ...event, code: ReconnectCode }
+				} else if (code !== undefined && code !== 1000 && code !== 1005) {
+					recordClose(`${code} ${event?.reason ?? ''} at ${when}`)
+				}
+			}
+		} catch (e) {
+			reportError(e)
+		}
+		return (original as (event: CloseEventLike) => unknown).call(this, forwarded)
+	}
+
+	transport.onclose = wrapped
+	return () => {
+		if (transport.onclose === wrapped) transport.onclose = original
+	}
+}
+
 function patchTransport(socket: GatewaySocket) {
 	const transport = socket.webSocket
 	if (!transport || typeof transport.send !== 'function') return
 	if (transportPatches.has(transport)) return
 
-	transportPatches.set(
-		transport,
-		before(transport, 'send', ([data]) => {
+	const unwrapClose = wrapClose(transport)
+	const unpatchSend = before(transport, 'send', ([data]) => {
 			if (typeof data !== 'string') return [data]
 			try {
 				const frame = JSON.parse(data)
@@ -140,8 +197,11 @@ function patchTransport(socket: GatewaySocket) {
 				}
 			}
 			return [data]
-		}),
-	)
+		})
+	transportPatches.set(transport, () => {
+		unpatchSend()
+		unwrapClose()
+	})
 }
 
 function unpatchTransports() {
@@ -258,6 +318,7 @@ export function forceIdentify() {
 		else patchTransport(socket)
 
 		lastIdentifyAt = Date.now()
+		authRescueUsed = false
 		forcedSockets.add(socket)
 		for (const listener of identifyListeners) listener()
 
