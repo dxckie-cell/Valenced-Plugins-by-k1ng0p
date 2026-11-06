@@ -5,7 +5,7 @@
 	"description": "Spoofs your Discord gateway platform so others see a different client icon on your profile.",
 	"author": "k1ng_op <641266820187160576> (https://github.com/k1ng0p \"GitHub\")",
 	"icon": "LaptopPhoneIcon",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"dependencies": {
 		"valenced.api": {
 			"version": ">=1 <2"
